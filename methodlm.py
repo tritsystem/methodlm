@@ -213,7 +213,84 @@ def make_tools(data, target, interventional):
                     "observational data adjust for confounders, not 'everything'.")
         return msg
 
-    return corr, run, strat, adjust
+    def interact(x, z):
+        """Tests the explicit PRODUCT term x*z as a candidate driver -- something CORR/ADJUST
+        structurally cannot see, by construction: a linear regression's fitted surface is
+        additive in its inputs, so a pure interaction (outcome driven by x*z, not x or z alone)
+        is invisible to it no matter how strong the real effect is. Verified directly: for
+        independent mean-zero x,z, corr(x,target) and corr(z,target) can both be ~0 while
+        corr(x*z,target) is ~1 -- the same odd/even symmetry argument as the point-group
+        selection rule (see github.com/tritsystem/symmetry-selection-rule): a purely
+        additive/linear method has no way to represent an even-order term until something
+        breaks that structure. Report only, not a full backdoor adjustment -- confirm x,z
+        aren't downstream of target before trusting this as causal, same caveat ADJUST's
+        bias-audit already carries."""
+        if x not in data or z not in data:
+            return f"unknown column(s); columns are {list(data)}"
+        rx = float(np.corrcoef(data[x], data[target])[0, 1])
+        rz = float(np.corrcoef(data[z], data[target])[0, 1])
+        product = np.asarray(data[x], float) * np.asarray(data[z], float)
+        rxz = float(np.corrcoef(product, data[target])[0, 1])
+        msg = (f"INTERACT: {x}*{z} vs {target} (n={len(data[target])}). "
+               f"Individually: corr({x},{target})={rx:+.2f}, corr({z},{target})={rz:+.2f}. "
+               f"Product term: corr({x}*{z},{target})={rxz:+.2f}.")
+        if abs(rxz) - max(abs(rx), abs(rz)) > 0.15:
+            msg += (f"\n[FOUND] the product explains far more than either variable alone -- "
+                    f"a real candidate INTERACTION driver, invisible to CORR/ADJUST's linear-"
+                    f"only view. Not yet a full causal claim: confirm neither {x} nor {z} is "
+                    f"downstream of {target} before trusting this.")
+        else:
+            msg += "\nNo meaningful interaction signal beyond what the individual variables already show."
+        return msg
+
+    return corr, run, strat, adjust, interact
+
+# ---------------- RECALL: optional semantic search over an external vault (OBSERVE) ----------------
+_OBSERVE_PATH = os.environ.get("METHODLM_OBSERVE_PATH")     # optional: path to an OBSERVE checkout
+_VAULT_INDEX_DIR = os.environ.get("METHODLM_VAULT_INDEX")   # optional: path to a pre-built OBSERVE index dir
+_VAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+_VAULT_ENGINE = None   # lazy singleton: loading the embedding model takes real seconds, do it once
+
+def _vault_engine():
+    """RECALL is fully optional, same pattern as the tritkit second witness above: unset
+    either env var and RECALL just reports itself unavailable rather than erroring. False
+    (not None) once tried-and-failed, so a missing index doesn't retry every call."""
+    global _VAULT_ENGINE
+    if _VAULT_ENGINE is not None:
+        return _VAULT_ENGINE
+    if not _OBSERVE_PATH or not _VAULT_INDEX_DIR:
+        _VAULT_ENGINE = False
+        return _VAULT_ENGINE
+    if _OBSERVE_PATH not in sys.path:
+        sys.path.insert(0, _OBSERVE_PATH)
+    try:
+        from search_engine import SearchEngine
+        eng = SearchEngine()
+        eng.load_blocking(_VAULT_INDEX_DIR, _VAULT_MODEL)
+        _VAULT_ENGINE = eng if eng.ready else False
+    except Exception as e:
+        print(f"[warn] RECALL vault search unavailable: {e}")
+        _VAULT_ENGINE = False
+    return _VAULT_ENGINE
+
+def recall(query, k=5):
+    """Real semantic search (MiniLM embeddings, not a keyword grep) over an external OBSERVE-
+    indexed corpus (e.g. a notes vault) -- 'did we already investigate/decide this before'
+    memory. NOT a causal test: does not count toward nrun and cannot satisfy the pre-FINAL
+    test requirement, same as ATTR/CORR. Fully optional -- see METHODLM_OBSERVE_PATH /
+    METHODLM_VAULT_INDEX above."""
+    eng = _vault_engine()
+    if not eng:
+        return ("RECALL unavailable: set METHODLM_OBSERVE_PATH (a checkout of OBSERVE, "
+                "https://github.com/tritsystem/observe-api) and METHODLM_VAULT_INDEX (a "
+                "pre-built semantic index directory) to enable it.")
+    hits = eng.search(query, k=k)
+    if not hits:
+        return f"RECALL: no vault matches for '{query}'."
+    lines = [f"RECALL: top {len(hits)} vault match(es) for '{query}':"]
+    for h in hits:
+        lines.append(f"  [{h['score']:.2f}] {os.path.basename(h['path'])}: {h['preview'][:160].strip()}")
+    return "\n".join(lines)
 
 # ---------------- REASON: the copilot loop ----------------
 def build_system(cols, target, interventional):
@@ -234,7 +311,17 @@ def build_system(cols, target, interventional):
           ADJUST: {a} | <other confounder columns>   (backdoor adjustment + sensitivity: effect
                                      of {a} on {target} controlling for the listed confounders,
                                      with a robustness value + a collider/mediator bias audit)
+          INTERACT: {a},<other column>   (tests the PRODUCT of two columns as a driver --
+                                     CORR/ADJUST are linear and CANNOT see a pure interaction
+                                     effect, even a perfect one, no matter how strong; if every
+                                     candidate looks fragile alone under ADJUST, try this before
+                                     concluding "no driver")
           ATTR:                    (the learned ternary model's evidence per column)
+          RECALL: <free-text query>   (semantic search over past vault notes/decisions for
+                                     relevant prior work -- memory, NOT a causal test; use it
+                                     ONCE, if at all, to check "did we already find this" before
+                                     re-deriving -- it cannot be used a second time; unavailable
+                                     unless METHODLM_OBSERVE_PATH/METHODLM_VAULT_INDEX are set)
         HOW TO FIND THE DRIVER: for a candidate X, run 'ADJUST: X | <the other candidate
         columns>'. The tool shows the full-set result AND a [BIAS-AUDIT]. HEED IT: drop any
         variable flagged as a COLLIDER (conditioning on it manufactures a fake effect), and do
@@ -247,11 +334,11 @@ def build_system(cols, target, interventional):
         cause; that is backwards. Strategy: ADJUST the tempting/decoy variable
         first; if it collapses, ADJUST the other strong candidate to confirm the real
         driver, then conclude.
-        Before any ADJUST/STRAT/RUN, include a 'PREREGISTER:' line in the SAME reply naming
-        the same X you test and what result confirms vs disconfirms. Comparing two
-        correlations is NOT a test. You MUST run at least one ADJUST/STRAT/RUN (never only
-        CORR) before any FINAL. Your FINAL must name the variable whose adjusted effect
-        SURVIVED as the driver (or say none did). Be brief.""")
+        Before any ADJUST/STRAT/RUN/INTERACT, include a 'PREREGISTER:' line in the SAME reply
+        naming the same X you test and what result confirms vs disconfirms. Comparing two
+        correlations is NOT a test. You MUST run at least one ADJUST/STRAT/RUN/INTERACT (never
+        only CORR) before any FINAL. Your FINAL must name the variable (or product of two
+        variables) whose effect SURVIVED as the driver (or say none did). Be brief.""")
 
 def ask(system, messages, n=230):
     return backend().generate(system, messages, n)
@@ -280,11 +367,11 @@ def investigate(name, data, target, question, interventional, answer_key=None, i
     except ImportError:
         nmse, share, gate = None, {}, []
         out("[compute] ternary second witness skipped (set METHODLM_TRITKIT + install torch to enable)")
-    corr, run, strat, adjust = make_tools(data, target, interventional)
+    corr, run, strat, adjust, interact = make_tools(data, target, interventional)
     system = build_system(list(data), target, interventional)
 
     msgs = [{"role": "user", "content": question}]
-    pre = nrun = 0
+    pre = nrun = n_recall = 0
     verdict = "(no verdict — ran out of turns)"
     seen = {}          # loop guard: signatures of tests already run
     stuck = 0          # consecutive turns producing no usable tool call
@@ -293,7 +380,7 @@ def investigate(name, data, target, question, interventional, answer_key=None, i
         # ENFORCE ONE ACTION PER TURN: keep text up to and including the first tool
         # directive (or FINAL); drop anything the model dumped after it.
         cut = None
-        for m in re.finditer(r"^\s*(CORR|RUN|STRAT|ADJUST|ATTR|FINAL)\b.*$", raw, re.MULTILINE | re.IGNORECASE):
+        for m in re.finditer(r"^\s*(CORR|RUN|STRAT|ADJUST|INTERACT|ATTR|RECALL|FINAL)\b.*$", raw, re.MULTILINE | re.IGNORECASE):
             cut = m.end(); break
         reply = raw[:cut] if cut else raw
         out(f"\n--- copilot turn {turn} ---\n{reply}")
@@ -304,8 +391,10 @@ def investigate(name, data, target, question, interventional, answer_key=None, i
         m_str = re.search(r"STRAT:\s*(\w+)\s*,\s*(\w+)", reply)
         m_cor = re.search(r"CORR:\s*(\w+)\s*,\s*(\w+)", reply)
         m_attr = re.search(r"\bATTR:", reply)
+        m_rec = re.search(r"RECALL:\s*(.+)$", reply, re.MULTILINE)
+        m_int = re.search(r"INTERACT:\s*(\w+)\s*,\s*(\w+)", reply)
         # FINAL honored ONLY when it's not a hedge AND a real test has run
-        if re.search(r"\bfinal\s*:", reply, re.IGNORECASE) and not (m_run or m_adj or m_str or m_cor or m_attr):
+        if re.search(r"\bfinal\s*:", reply, re.IGNORECASE) and not (m_run or m_adj or m_str or m_cor or m_attr or m_int):
             if nrun < 1:
                 out("[TOOL] REFUSED: comparing correlations is not a test. Run one STRAT or "
                     "RUN before concluding.")
@@ -328,6 +417,9 @@ def investigate(name, data, target, question, interventional, answer_key=None, i
                    else strat(m_str.group(1), m_str.group(2))); nrun += bool(m_str) and "PREREGISTER:" in reply
         elif m_cor:
             res = corr(m_cor.group(1), m_cor.group(2))
+        elif m_int:
+            res = ("REFUSED: PREREGISTER in the same reply first." if "PREREGISTER:" not in reply
+                   else interact(m_int.group(1), m_int.group(2))); nrun += "PREREGISTER:" in reply
         elif re.search(r"\bATTR:", reply):
             if nmse is None:
                 res = "Ternary second witness unavailable (install torch + set METHODLM_TRITKIT)."
@@ -335,11 +427,26 @@ def investigate(name, data, target, question, interventional, answer_key=None, i
                 res = (f"Ternary readout (NMSE {nmse:.2f}) evidence share: "
                        + ", ".join(f"{k}: {v*100:.0f}%" for k, v in share.items())
                        + f". Gate connects: {', '.join(gate)}.")
+        elif m_rec:
+            # SINGLE-USE GUARD: a weak model echoing the [TOOL] result text back as its own
+            # next RECALL: line was a real, observed failure mode (spiraling into nested
+            # self-quoting, e.g. "RECALL: top 5 vault match(es) for 'top 5 vault match(es)...'"
+            # until it lost the ability to emit any tool line at all). RECALL's job is a
+            # one-time "did we already do this" memory check, not a repeatable action, so cap
+            # it at one real call per investigation regardless of query content.
+            n_recall += 1
+            if n_recall > 1:
+                res = ("REFUSED: RECALL already used once this investigation -- it is a one-time "
+                       "memory check, not repeatable. PREREGISTER and run a real causal test "
+                       "(ADJUST/STRAT/RUN) now.")
+            else:
+                query = m_rec.group(1).strip()[:200]   # cap length: reject echoed-tool-output blowup
+                res = recall(query)
         else:
-            res = "No tool recognized. Use CORR:, STRAT:/RUN:, ATTR:, or FINAL:."
+            res = "No tool recognized. Use CORR:, STRAT:/RUN:, ADJUST:, INTERACT:, ATTR:, RECALL:, or FINAL:."
         # LOOP GUARD: a weak model can re-run the same test forever. If a real test
         # repeats, don't re-run it -- nudge to conclude; force a stop on a 2nd repeat.
-        sig = next((g.groups() for g in (m_run, m_adj, m_str, m_cor) if g), None)
+        sig = next((g.groups() for g in (m_run, m_adj, m_str, m_cor, m_int) if g), None)
         if sig and not str(res).startswith(("REFUSED", "Clamp")):
             if sig in seen:
                 seen[sig] += 1

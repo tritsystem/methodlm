@@ -102,6 +102,20 @@ def train_readout(data, target):
             [names[i] for i in range(len(names)) if lyr.G[0, i] > 0])
 
 # ---------------- tools ----------------
+_DOWHY_OK = None
+def _dowhy_available():
+    """Same lazy-singleton optional-dependency pattern as RECALL's
+    _vault_engine() below: tried-and-failed is cached (True/False), not
+    retried every call."""
+    global _DOWHY_OK
+    if _DOWHY_OK is None:
+        try:
+            import dowhy  # noqa: F401
+            _DOWHY_OK = True
+        except ImportError:
+            _DOWHY_OK = False
+    return _DOWHY_OK
+
 def make_tools(data, target, interventional):
     def corr(a, b):
         if a not in data or b not in data:
@@ -243,7 +257,66 @@ def make_tools(data, target, interventional):
             msg += "\nNo meaningful interaction signal beyond what the individual variables already show."
         return msg
 
-    return corr, run, strat, adjust, interact
+    def refute(x, zs):
+        """DoWhy-backed refutation testing -- a SECOND, independently-derived
+        robustness check on the SAME x|zs hypothesis ADJUST already tested,
+        using an established causal-inference library's estimator plus three
+        real perturbation tests, instead of this file's own hand-rolled
+        Cinelli-Hazlett RV. Does NOT resolve confounder-vs-mediator ambiguity
+        (see ADJUST's bias-audit for that, still a DAG/time-order question
+        data alone can't answer) -- it only asks whether the NUMERICAL
+        estimate survives real perturbation:
+          placebo treatment   -- effect should COLLAPSE toward 0 (confirms
+                                  the estimate isn't a fitting-procedure
+                                  artifact; treatment is randomly permuted)
+          random common cause -- effect should barely CHANGE (a real,
+                                  already-adjusted effect shouldn't move much
+                                  from one more irrelevant confounder)
+          data subset (80%)   -- effect should barely CHANGE (not driven by
+                                  a handful of influential points)
+        Stochastic (permutation/resampling-based) -- re-running can shift the
+        exact numbers slightly; the qualitative collapsed/stable read is what
+        matters, not the third decimal place."""
+        if not _dowhy_available():
+            return "REFUTE unavailable: pip install dowhy to enable (not a core dependency)."
+        if x not in data:
+            return f"unknown column '{x}'; columns are {list(data)}"
+        zs = [z for z in zs if z in data and z not in (x, target)]
+        import pandas as pd
+        from dowhy import CausalModel
+        df = pd.DataFrame({c: data[c] for c in data})
+        try:
+            cm = CausalModel(data=df, treatment=x, outcome=target, common_causes=zs or None)
+            identified = cm.identify_effect(proceed_when_unidentifiable=True)
+            est = cm.estimate_effect(identified, method_name="backdoor.linear_regression")
+            orig = float(est.value)
+            placebo = cm.refute_estimate(identified, est, method_name="placebo_treatment_refuter", placebo_type="permute")
+            rcc = cm.refute_estimate(identified, est, method_name="random_common_cause")
+            subset = cm.refute_estimate(identified, est, method_name="data_subset_refuter", subset_fraction=0.8)
+        except Exception as e:
+            return f"REFUTE error (DoWhy could not fit/refute this model): {e}"
+
+        zst = ", ".join(zs) if zs else "nothing"
+        p_new, rcc_new, subset_new = float(placebo.new_effect), float(rcc.new_effect), float(subset.new_effect)
+        scale = abs(orig) if abs(orig) > 1e-9 else 1e-9
+        collapsed = abs(p_new) < 0.1 * scale
+        stable_rcc = abs(rcc_new - orig) < 0.2 * scale
+        stable_subset = abs(subset_new - orig) < 0.2 * scale
+        n_pass = sum([collapsed, stable_rcc, stable_subset])
+
+        msg = (f"REFUTE (DoWhy): effect of {x} on {target} controlling for [{zst}] -- "
+               f"original estimate {orig:+.3f} (backdoor.linear_regression, independent of ADJUST's own fit).\n"
+               f"  placebo treatment: new effect {p_new:+.3f} -- "
+               + ("collapsed toward 0, as expected for a real effect." if collapsed
+                  else "did NOT collapse -- suspicious; the estimate may reflect the fitting procedure, not a real relationship.") + "\n"
+               f"  random common cause: new effect {rcc_new:+.3f} -- "
+               + ("stable." if stable_rcc else "changed notably -- sensitive to an irrelevant confounder, a fragility signal.") + "\n"
+               f"  data subset (80%): new effect {subset_new:+.3f} -- "
+               + ("stable." if stable_subset else "changed notably -- may be driven by a subset of influential points.") + "\n"
+               f"[{n_pass}/3 refutation checks consistent with a real, stable effect]")
+        return msg
+
+    return corr, run, strat, adjust, interact, refute
 
 # ---------------- RECALL: optional semantic search over an external vault (OBSERVE) ----------------
 _OBSERVE_PATH = os.environ.get("METHODLM_OBSERVE_PATH")     # optional: path to an OBSERVE checkout
@@ -316,6 +389,14 @@ def build_system(cols, target, interventional):
                                      effect, even a perfect one, no matter how strong; if every
                                      candidate looks fragile alone under ADJUST, try this before
                                      concluding "no driver")
+          REFUTE: {a} | <same confounder columns as your ADJUST call>   (SECOND, independent
+                                     robustness check on a candidate ADJUST already found
+                                     promising -- DoWhy's own estimator + 3 real perturbation
+                                     tests: placebo treatment should COLLAPSE the effect,
+                                     random common cause and data-subset should barely change
+                                     it. Use AFTER ADJUST on the same candidate, not instead of
+                                     it -- ADJUST's bias-audit and REFUTE's perturbation checks
+                                     catch different failure modes.)
           ATTR:                    (the learned ternary model's evidence per column)
           RECALL: <free-text query>   (semantic search over past vault notes/decisions for
                                      relevant prior work -- memory, NOT a causal test; use it
@@ -333,9 +414,11 @@ def build_system(cols, target, interventional):
         the variable you controlled for. Do not name a conditioning/control variable as the
         cause; that is backwards. Strategy: ADJUST the tempting/decoy variable
         first; if it collapses, ADJUST the other strong candidate to confirm the real
-        driver, then conclude.
-        Before any ADJUST/STRAT/RUN/INTERACT, include a 'PREREGISTER:' line in the SAME reply
-        naming the same X you test and what result confirms vs disconfirms. Comparing two
+        driver; once one survives, REFUTE it on the same X | <same confounders> as a second,
+        independently-derived check before concluding (if REFUTE is unavailable it will say so
+        -- don't let that block FINAL, ADJUST's own robustness value already counts as a test).
+        Before any ADJUST/STRAT/RUN/INTERACT/REFUTE, include a 'PREREGISTER:' line in the SAME
+        reply naming the same X you test and what result confirms vs disconfirms. Comparing two
         correlations is NOT a test. You MUST run at least one ADJUST/STRAT/RUN/INTERACT (never
         only CORR) before any FINAL. Your FINAL must name the variable (or product of two
         variables) whose effect SURVIVED as the driver (or say none did). Be brief.""")
@@ -367,7 +450,7 @@ def investigate(name, data, target, question, interventional, answer_key=None, i
     except ImportError:
         nmse, share, gate = None, {}, []
         out("[compute] ternary second witness skipped (set METHODLM_TRITKIT + install torch to enable)")
-    corr, run, strat, adjust, interact = make_tools(data, target, interventional)
+    corr, run, strat, adjust, interact, refute = make_tools(data, target, interventional)
     system = build_system(list(data), target, interventional)
 
     msgs = [{"role": "user", "content": question}]
@@ -380,7 +463,7 @@ def investigate(name, data, target, question, interventional, answer_key=None, i
         # ENFORCE ONE ACTION PER TURN: keep text up to and including the first tool
         # directive (or FINAL); drop anything the model dumped after it.
         cut = None
-        for m in re.finditer(r"^\s*(CORR|RUN|STRAT|ADJUST|INTERACT|ATTR|RECALL|FINAL)\b.*$", raw, re.MULTILINE | re.IGNORECASE):
+        for m in re.finditer(r"^\s*(CORR|RUN|STRAT|ADJUST|INTERACT|REFUTE|ATTR|RECALL|FINAL)\b.*$", raw, re.MULTILINE | re.IGNORECASE):
             cut = m.end(); break
         reply = raw[:cut] if cut else raw
         out(f"\n--- copilot turn {turn} ---\n{reply}")
@@ -393,8 +476,9 @@ def investigate(name, data, target, question, interventional, answer_key=None, i
         m_attr = re.search(r"\bATTR:", reply)
         m_rec = re.search(r"RECALL:\s*(.+)$", reply, re.MULTILINE)
         m_int = re.search(r"INTERACT:\s*(\w+)\s*,\s*(\w+)", reply)
+        m_ref = re.search(r"REFUTE:\s*(\w+)\s*\|\s*([\w,\s]*)", reply)
         # FINAL honored ONLY when it's not a hedge AND a real test has run
-        if re.search(r"\bfinal\s*:", reply, re.IGNORECASE) and not (m_run or m_adj or m_str or m_cor or m_attr or m_int):
+        if re.search(r"\bfinal\s*:", reply, re.IGNORECASE) and not (m_run or m_adj or m_str or m_cor or m_attr or m_int or m_ref):
             if nrun < 1:
                 out("[TOOL] REFUSED: comparing correlations is not a test. Run one STRAT or "
                     "RUN before concluding.")
@@ -420,6 +504,10 @@ def investigate(name, data, target, question, interventional, answer_key=None, i
         elif m_int:
             res = ("REFUSED: PREREGISTER in the same reply first." if "PREREGISTER:" not in reply
                    else interact(m_int.group(1), m_int.group(2))); nrun += "PREREGISTER:" in reply
+        elif m_ref:
+            zs = [z.strip() for z in m_ref.group(2).split(",") if z.strip()]
+            res = ("REFUSED: PREREGISTER in the same reply first." if "PREREGISTER:" not in reply
+                   else refute(m_ref.group(1), zs)); nrun += "PREREGISTER:" in reply
         elif re.search(r"\bATTR:", reply):
             if nmse is None:
                 res = "Ternary second witness unavailable (install torch + set METHODLM_TRITKIT)."
@@ -443,17 +531,22 @@ def investigate(name, data, target, question, interventional, answer_key=None, i
                 query = m_rec.group(1).strip()[:200]   # cap length: reject echoed-tool-output blowup
                 res = recall(query)
         else:
-            res = "No tool recognized. Use CORR:, STRAT:/RUN:, ADJUST:, INTERACT:, ATTR:, RECALL:, or FINAL:."
+            res = "No tool recognized. Use CORR:, STRAT:/RUN:, ADJUST:, INTERACT:, REFUTE:, ATTR:, RECALL:, or FINAL:."
         # LOOP GUARD: a weak model can re-run the same test forever. If a real test
         # repeats, don't re-run it -- nudge to conclude; force a stop on a 2nd repeat.
-        sig = next((g.groups() for g in (m_run, m_adj, m_str, m_cor, m_int) if g), None)
+        # Tagged with the tool name: REFUTE is DESIGNED to be re-run on the exact same
+        # (x, zs) an ADJUST call already used (a second, independent robustness check
+        # on the same candidate) -- an untagged sig would wrongly flag that as a repeat.
+        _sig_src = [("RUN", m_run), ("ADJUST", m_adj), ("STRAT", m_str), ("CORR", m_cor),
+                    ("INTERACT", m_int), ("REFUTE", m_ref)]
+        sig = next(((tag, g.groups()) for tag, g in _sig_src if g), None)
         if sig and not str(res).startswith(("REFUSED", "Clamp")):
             if sig in seen:
                 seen[sig] += 1
                 # nudge toward the NEXT untested candidate (not FINAL) -- a collapsed test
                 # means that variable is a bystander, not that the job is done.
-                tested = ", ".join(sorted({s[0] for s in seen})) or "none"
-                untested = [c for c in data if c not in (target,) and c not in {s[0] for s in seen}]
+                tested = ", ".join(sorted({s[1][0] for s in seen})) or "none"
+                untested = [c for c in data if c not in (target,) and c not in {s[1][0] for s in seen}]
                 res = (f"{res}\n[REPEAT: you already ran this. A collapsed effect (RV<0.10) means "
                        f"that variable is a BYSTANDER, not the answer. You have tested: {tested}. "
                        f"Now run ADJUST on a DIFFERENT untested candidate ({', '.join(untested) or 'none left'}) "

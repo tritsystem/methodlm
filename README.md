@@ -29,6 +29,7 @@ held to the *same* standard: no `FINAL` verdict without a real, pre-registered t
 | `RUN` | a true controlled experiment (interventional demo world) |
 | `STRAT` | stratified check — does the link survive inside bands of a confounder? |
 | `ADJUST` | **backdoor adjustment + sensitivity + bias audit** — effect of X on the target controlling for named confounders, with a Cinelli–Hazlett **robustness value** (how strong a *hidden* confounder would need to be to overturn it; `RV < 0.10` = fragile), **plus a collider/mediator audit** that flags when conditioning on a variable would *introduce* bias (the "Table 2 fallacy"). It detects the data-visible danger (a collider) and honestly defers mediator-vs-confounder to your DAG — so it never tells you to blindly "adjust for everything." |
+| `REFUTE` | **DoWhy-backed refutation testing** (optional — needs `pip install dowhy`) — a second, independently-derived robustness check on a candidate ADJUST already found promising: DoWhy's own `backdoor.linear_regression` estimator, then three real perturbation tests (placebo treatment, random common cause, data-subset). A real effect should collapse toward 0 under the placebo and barely move under the other two. Checks numerical robustness, not causal role — it doesn't replace ADJUST's collider/mediator audit. |
 | `ATTR` | the ternary compute gate's independent evidence per column (the optional second witness) |
 
 Pre-registration is enforced: no `FINAL` is accepted until at least one real test
@@ -41,6 +42,7 @@ pip install numpy                       # required — the reasoning harness + t
 pip install anthropic                   # optional — to drive a frontier model (--model opus/sonnet/haiku)
 pip install pandas pyarrow openpyxl     # optional — extra data formats (Parquet / Excel)
 pip install torch                       # optional — enables the ternary second witness
+pip install dowhy                       # optional — enables REFUTE (independent robustness check)
 ```
 
 - **Reasoning half** runs on `numpy` alone.

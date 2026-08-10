@@ -5,7 +5,7 @@ it **computes** on it (a ternary two-timescale readout) and **reasons** about it
 gbranaa-hue research method — pre-registering every test and keeping an audit trail — so any
 model has to *prove* its causal claims instead of asserting them.
 
-> Part of the ternary line — sibling to **[OBSERVE / 012-trit-search](https://github.com/gbranaa4-hue/012-trit-search)**
+> Part of the ternary line — sibling to **[OBSERVE / 012-trit-search](https://github.com/tritsystem/012-trit-search)**
 > (local, private semantic code search). OBSERVE searches your code privately; MethodLM
 > reasons about your data honestly. The optional ternary "second witness" here uses the same
 > `tritkit` two-timescale layer.
@@ -49,7 +49,7 @@ pip install dowhy                       # optional — enables REFUTE (independe
 - **Frontier backend** needs `anthropic` + `ANTHROPIC_API_KEY` (set a low workspace spend limit).
 - **Local backend** needs a llama.cpp `llama-completion` binary + a small GGUF (e.g. Qwen); point `methodlm_models.py` at yours. (Weights/binaries are not shipped here.)
 - **Ternary second witness** (optional) needs `torch` + `tritkit` (from
-  [012-trit-search](https://github.com/gbranaa4-hue/012-trit-search)); set
+  [012-trit-search](https://github.com/tritsystem/012-trit-search)); set
   `METHODLM_TRITKIT=/path/to/tritkit_parent`. Without it, MethodLM prints a note and runs the
   reasoning half normally.
 

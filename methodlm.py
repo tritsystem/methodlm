@@ -458,7 +458,9 @@ def investigate(name, data, target, question, interventional, answer_key=None, i
     verdict = "(no verdict — ran out of turns)"
     seen = {}          # loop guard: signatures of tests already run
     stuck = 0          # consecutive turns producing no usable tool call
-    for turn in range(1, 10):
+    best_rv = {}       # best (highest) RV seen per tested column -- drives the proactive
+                        # "all candidates tested, conclude now" nudge
+    for turn in range(1, 13):
         raw = ask(system, msgs)
         # ENFORCE ONE ACTION PER TURN: keep text up to and including the first tool
         # directive (or FINAL); drop anything the model dumped after it.
@@ -531,7 +533,28 @@ def investigate(name, data, target, question, interventional, answer_key=None, i
                 query = m_rec.group(1).strip()[:200]   # cap length: reject echoed-tool-output blowup
                 res = recall(query)
         else:
-            res = "No tool recognized. Use CORR:, STRAT:/RUN:, ADJUST:, INTERACT:, REFUTE:, ATTR:, RECALL:, or FINAL:."
+            # Real observed failure mode (live UI test): the model wrote free prose containing
+            # "ADJUST" instead of the exact syntax ("ADJUST: effect of humidity on error
+            # controlling for [temperature, vibration]...") and got a generic "No tool
+            # recognized" that didn't teach it the fix -- it then burned the rest of its turn
+            # budget without ever recovering. Detecting the attempted keyword and echoing back
+            # the exact expected syntax gives it a real shot at self-correcting next turn.
+            upper = reply.upper()
+            if "REFUTE" in upper:
+                hint = " Correct REFUTE syntax: 'REFUTE: x | z1,z2' (same shape as ADJUST -- pipe before confounders)."
+            elif "ADJUST" in upper:
+                hint = " Correct ADJUST syntax: 'ADJUST: x | z1,z2' (pipe before confounders, comma-separated, no prose)."
+            elif "INTERACT" in upper:
+                hint = " Correct INTERACT syntax: 'INTERACT: x,z' (exactly two column names, comma-separated)."
+            elif "STRAT" in upper:
+                hint = " Correct STRAT syntax: 'STRAT: x,z' (exactly two column names, comma-separated)."
+            elif "RUN" in upper:
+                hint = " Correct RUN syntax: 'RUN: vary=x, clamp={z:NUMBER}' (clamp value must be a number)."
+            elif "CORR" in upper:
+                hint = " Correct CORR syntax: 'CORR: x,y' (exactly two column names, comma-separated)."
+            else:
+                hint = ""
+            res = f"No tool recognized.{hint} Use CORR:, STRAT:/RUN:, ADJUST:, INTERACT:, REFUTE:, ATTR:, RECALL:, or FINAL:."
         # LOOP GUARD: a weak model can re-run the same test forever. If a real test
         # repeats, don't re-run it -- nudge to conclude; force a stop on a 2nd repeat.
         # Tagged with the tool name: REFUTE is DESIGNED to be re-run on the exact same
@@ -541,6 +564,31 @@ def investigate(name, data, target, question, interventional, answer_key=None, i
                     ("INTERACT", m_int), ("REFUTE", m_ref)]
         sig = next(((tag, g.groups()) for tag, g in _sig_src if g), None)
         if sig and not str(res).startswith(("REFUSED", "Clamp")):
+            # Track the best (highest) RV seen per tested column -- real bug, found by
+            # running this exact scenario: the model found the correct driver (humidity,
+            # RV=0.42) at turn 6, ruled out the only other candidate at turn 7, then instead
+            # of concluding, re-ran an already-collapsed test a 3rd time and got hard-stopped
+            # by the loop-guard with NO verdict, despite the right answer already sitting in
+            # the transcript. The "all candidates tested, none left" signal already existed
+            # but only fired reactively inside the repeat-branch below -- one turn too late
+            # to have prevented the wasted turn-8 retry. Checking it proactively, right after
+            # the test that completes coverage, gives the model the strongest signal a full
+            # turn earlier. sig[1][0] (not sig[0]) -- sig is (tag, groups) here, tagged so
+            # REFUTE re-testing the same candidate ADJUST already used isn't misread as a repeat.
+            rv_match = re.search(r"RV=([\d.]+)", str(res))
+            if rv_match:
+                col = sig[1][0]
+                best_rv[col] = max(best_rv.get(col, 0.0), float(rv_match.group(1)))
+                all_candidates = [c for c in data if c != target]
+                if set(best_rv) >= set(all_candidates):
+                    survivors = [c for c, rv in best_rv.items() if rv >= 0.10]
+                    bystanders = [c for c in all_candidates if c not in survivors]
+                    if survivors:
+                        res = (f"{res}\n[ALL CANDIDATES TESTED] Survivor(s) with RV>=0.10: "
+                               f"{', '.join(survivors)}. Bystander(s) with RV<0.10: "
+                               f"{', '.join(bystanders) or 'none'}. You have enough evidence -- "
+                               f"reply FINAL now naming the survivor as the driver. Do not run "
+                               f"another test.")
             if sig in seen:
                 seen[sig] += 1
                 # nudge toward the NEXT untested candidate (not FINAL) -- a collapsed test

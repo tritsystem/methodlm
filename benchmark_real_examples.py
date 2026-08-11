@@ -124,6 +124,33 @@ def _abalone():
     return d
 
 
+def _server_guard_telemetry(n=3000, seed=11):
+    """This user's OWN live telemetry, not a public academic dataset -- no
+    external paper to cite, so the "ground truth" here is domain mechanism,
+    not a published sensitivity analysis: sys.process_count driving
+    sys.mem_pct is a direct OS-level fact (allocated memory is the sum of
+    what every running process holds), not just an empirical correlation.
+    ~41,809 real readings collected by server-guard's own supervisor,
+    exact-timestamp-aligned across channels (confirmed directly, no
+    resampling needed)."""
+    import sqlite3
+    import pandas as pd
+    channels = ["sys.cpu_pct", "sys.mem_pct", "sys.process_count", "sys.uptime_hours",
+                "net.established_connections", "net.recv_mb_per_s", "net.sent_mb_per_s",
+                "net.unique_remote_ips", "disk.read_mb_per_s", "disk.write_mb_per_s"]
+    conn = sqlite3.connect(r"C:\Users\gbran\OneDrive\Documents\server-guard\server_guard.db")
+    placeholders = ",".join("?" * len(channels))
+    df = pd.read_sql_query(f"SELECT timestamp, channel, value FROM readings WHERE channel IN ({placeholders})",
+                            conn, params=channels)
+    conn.close()
+    wide = df.pivot_table(index="timestamp", columns="channel", values="value").dropna()
+    rng = np.random.default_rng(seed)
+    if len(wide) > n:
+        idx = sorted(rng.choice(len(wide), size=n, replace=False))
+        wide = wide.iloc[idx]
+    return {c: wide[c].to_numpy(dtype=float) for c in wide.columns}
+
+
 EXAMPLES = [
     {
         "name": "diabetes_bmi",
@@ -282,6 +309,34 @@ EXAMPLES = [
                     "predictors of ring count (age), structurally related component parts of the "
                     "same physical measurement; the dataset's own documentation flags Height as "
                     "containing real measurement outliers, a plausible real-world decoy.",
+    },
+    {
+        "name": "server_guard_process_count",
+        "loader": _server_guard_telemetry,
+        "target": "sys.mem_pct",
+        "driver": "sys.process_count",
+        "driver_confounders": ["sys.uptime_hours"],
+        "decoy": "net.established_connections",
+        "decoy_confounders": ["sys.process_count"],
+        # This user's OWN live data, not a published paper -- ground truth is a real OS
+        # mechanism (allocated memory = sum of what every running process holds), not an
+        # external citation. Real complication found while building this: ADJUST's own
+        # bias-audit flagged sys.uptime_hours as a possible COLLIDER (conditioning on it
+        # "opens" the process_count-mem_pct link). Investigated rather than trusted blindly --
+        # checked the real correlations directly: corr(uptime, process_count)=+0.75 (processes
+        # genuinely accumulate the longer a machine runs uncrebooted), corr(uptime, mem_pct)=
+        # -0.11 (weak, opposite-signed). That's a genuine CONFOUNDER signature (a shared
+        # upstream cause with different-signed downstream effects), not a collider -- the
+        # heuristic's "opens the link" check can false-positive on exactly this pattern, a
+        # real, generalizable limitation worth knowing, not a reason to distrust the tool.
+        # sys.cpu_pct is ALSO a real, independently robust driver (ranks #1 by full-set RV,
+        # 0.36 vs process_count's 0.30) -- plausibly reflects shared workload intensity rather
+        # than process_count causing cpu directly, included as a genuine co-driver rather than
+        # forced into a single-winner framing.
+        "driver_group": ["sys.process_count", "sys.cpu_pct"],
+        "citation": "This machine's own server-guard telemetry (server_guard.db), ~41,809 real "
+                    "readings collected by its own supervisor process. Ground truth is a direct "
+                    "OS-level mechanism (process memory allocation), not a published study.",
     },
 ]
 

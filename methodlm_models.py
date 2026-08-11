@@ -82,11 +82,17 @@ class HFModel:
 
 def get_model(name, here):
     name = (name or "local").lower()
-    llama = os.path.join(here, "bin", "llama-completion.exe")
+    # The real llama-completion.exe + DLLs + GGUF files are a multi-GB local build, not
+    # something to duplicate into every checkout that imports methodlm.py -- optional override
+    # for when they live somewhere other than next to this file (e.g. mesh_rag_server.py imports
+    # methodlm.py from the canonical repo, but the actual binary/GGUFs only exist in llama_demo).
+    # Defaults to `here` (unchanged behavior) if unset.
+    bin_dir = os.environ.get("METHODLM_LOCAL_BIN_DIR", here)
+    llama = os.path.join(bin_dir, "bin", "llama-completion.exe")
     if name in ("local", "qwen", "llama", "qwen3b", "3b"):
-        return LocalLlama(llama, os.path.join(here, "qwen3b.gguf"))
+        return LocalLlama(llama, os.path.join(bin_dir, "qwen3b.gguf"))
     if name in ("qwen05b", "qwen0.5b", "0.5b", "small"):
-        return LocalLlama(llama, os.path.join(here, "qwen.gguf"))
+        return LocalLlama(llama, os.path.join(bin_dir, "qwen.gguf"))
     if name in ("baked", "method-baked", "baked05b"):
         return HFModel(os.path.join(here, "method_baked_v2"), "method-baked Qwen-0.5B")
     frontier = {"claude": "claude-opus-4-8", "opus": "claude-opus-4-8",
